@@ -1,3 +1,5 @@
 __pycache__/
+library.db
+library.db-journal
 library.json
 library.json.tmp

@@ -3,11 +3,13 @@ import tempfile
 import unittest
 
 from library import Library, LibraryError
+from storage import SqliteStore
 
 
 class LibraryTest(unittest.TestCase):
     def setUp(self):
         self.library = Library()
+        self.addCleanup(self.library.close)
         self.book = self.library.add_book("Dune", "Frank Herbert", copies=2)
         self.ana = self.library.register_member("Ana")
         self.ben = self.library.register_member("Ben")
@@ -72,17 +74,19 @@ class LibraryTest(unittest.TestCase):
 class PersistenceTest(unittest.TestCase):
     def test_state_survives_reload(self):
         with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "library.json")
-            first = Library(path)
-            first.add_book("Dune", "Frank Herbert")
-            first.register_member("Ana")
-            first.issue_book("B1", "M1")
+            path = os.path.join(folder, "library.db")
+            with SqliteStore(path) as store:
+                first = Library(store)
+                first.add_book("Dune", "Frank Herbert")
+                first.register_member("Ana")
+                first.issue_book("B1", "M1")
 
-            second = Library(path)
-            self.assertEqual(second.books["B1"].title, "Dune")
-            self.assertEqual(second.members["M1"].name, "Ana")
-            self.assertEqual(second.available_copies("B1"), 0)
-            self.assertEqual(second.register_member("Ben").id, "M2")
+            with SqliteStore(path) as store:
+                second = Library(store)
+                self.assertEqual(second.get_book("B1").title, "Dune")
+                self.assertEqual(second.get_member("M1").name, "Ana")
+                self.assertEqual(second.available_copies("B1"), 0)
+                self.assertEqual(second.register_member("Ben").id, "M2")
 
 
 if __name__ == "__main__":
