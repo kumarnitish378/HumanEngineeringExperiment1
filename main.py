@@ -3,7 +3,12 @@
 import os
 import sys
 
-from errors import LibraryError, StorageError
+from errors import (
+    AlreadyPopulatedError,
+    DatabaseBusyError,
+    LibraryError,
+    StorageError,
+)
 from legacy_import import import_legacy_json
 from library import Library
 from storage import SqliteStore
@@ -123,7 +128,10 @@ ACTIONS = {
 
 def import_legacy_data(store):
     if store.is_empty() and os.path.exists(LEGACY_DATA_FILE):
-        import_legacy_json(LEGACY_DATA_FILE, store)
+        try:
+            import_legacy_json(LEGACY_DATA_FILE, store)
+        except AlreadyPopulatedError:
+            return  # another running instance imported it first
         print(f"Imported existing data from {LEGACY_DATA_FILE}.")
 
 
@@ -142,6 +150,8 @@ def run_menu(library):
                 action(library)
             except LibraryError as error:
                 print(f"Error: {error}")
+            except DatabaseBusyError:
+                print("The library is busy, nothing was changed. Try again.")
             except StorageError as error:
                 print(f"Storage error, nothing was changed: {error}")
     except (EOFError, KeyboardInterrupt):

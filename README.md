@@ -5,7 +5,7 @@ members, issues and returns books, and keeps a permanent borrowing history.
 
 ## Setup
 
-You need Python 3.10 or newer. There is nothing to install: the project uses
+You need Python 3.11 or newer. There is nothing to install: the project uses
 only the standard library, including `sqlite3`.
 
 ```
@@ -45,6 +45,12 @@ python -m unittest
 | `test_storage.py` | Restarts, corrupted data, write failures, process crashes, schema rules |
 | `test_legacy_import.py` | Importing the old JSON format |
 | `test_main.py` | The real program, run as a separate process |
+| `test_reliability.py` | Thread and process races, failure injection at every step, crash recovery, corrupted records, schema upgrades |
+
+`test_reliability.py` starts real processes, so it takes longer than the others.
+Races are coordinated with barriers and events, not timed sleeps. Thread and
+process races can still interleave differently from run to run, but the expected
+result is the same for every interleaving.
 
 ## Storage
 
@@ -61,6 +67,12 @@ run the program from. It is excluded from git.
   If the JSON file is invalid, nothing is imported and the program stops so you
   can fix it. The JSON file is never modified, and it is ignored once the
   database has data.
+- **Upgrading the database:** an older `library.db` is upgraded automatically at
+  startup, in one transaction. A database from a newer version of the program is
+  refused and left untouched.
+- **After a crash:** just start the program again. SQLite undoes any unfinished
+  transaction using `library.db-journal`, so never delete that file by hand.
+  Back it up along with `library.db` if it is present after a crash.
 
 ## Project structure
 
@@ -96,7 +108,23 @@ an invalid loan.
 
 **Writes take the lock first.** Transactions use `BEGIN IMMEDIATE`, so a check
 such as "is this copy free?" stays true until the commit, even when two instances
-act at the same moment.
+act at the same moment. ID generation runs inside the same lock, so concurrent
+creation cannot produce duplicate IDs.
+
+**Busy databases are retried as whole operations.** Every `Library` change is one
+function passed to `SqliteStore.atomic()`. SQLite waits up to 5 seconds for a lock
+on each attempt. If it is still locked, the transaction rolls back and the whole
+function runs again, up to 5 attempts with random backoff, so every check is
+repeated against current data. After that, `DatabaseBusyError` reaches the caller.
+Other failures are not retried, because they would not be expected to clear.
+
+**History can only move forward.** Triggers allow a loan one change: closing it,
+once. Copies cannot be deleted or changed, so a copy ID always means one physical
+item.
+
+**Rollback journal rather than WAL.** WAL would let reads continue during a write,
+but it adds extra files that must be backed up together. This workload is small
+and writes are short, so retries handle the contention.
 
 **Rule violations and system failures are separate.** `LibraryError` subclasses
 are mistakes the user can correct. `StorageError` means the data could not be read
@@ -134,8 +162,17 @@ implementation. One can be extracted if a second is ever needed.
   cannot tell it apart from a new file.
 - Integrity checks run in full at startup, which will slow down on very large
   databases. They do not run again while the program is open.
-- If another instance holds the write lock for more than 5 seconds, the operation
-  fails with a storage error and can be retried.
+- If the database stays locked through every retry, the operation fails with
+  `DatabaseBusyError`, changes nothing and can be tried again. All writes run one
+  at a time, so throughput is limited by disk commit speed.
+- A disk failure reported during a commit is treated as a failed write. Whether
+  committed data really reached the disk depends on the disk and operating system
+  honouring flush requests.
+- Rules in the schema protect against code bugs and ordinary SQL. Someone editing
+  the file with SQL tools can still remove the triggers. Such damage is detected
+  at startup only if it breaks a constraint.
+- Integrity checks of the whole file run only at startup. Bad data written by
+  another tool while the program runs is reported when a read reaches it.
 - SQLite locking is unreliable on network drives, so keep `library.db` on a local
   disk.
 - Dates come from the local system clock. If the clock moves backwards, a return

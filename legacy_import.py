@@ -7,7 +7,7 @@ one transaction, so a bad file imports nothing. The JSON file is only read.
 import json
 from datetime import date
 
-from errors import CorruptedDataError, StorageError
+from errors import AlreadyPopulatedError, CorruptedDataError, StorageError
 from models import (
     BOOK_ID_PATTERN,
     MEMBER_ID_PATTERN,
@@ -19,8 +19,6 @@ from models import (
 
 def import_legacy_json(path, store):
     """Copy books, members and loans from path into an empty store."""
-    if not store.is_empty():
-        raise StorageError("Legacy data can only be imported into an empty store.")
     try:
         with open(path, encoding="utf-8") as file:
             data = json.load(file)
@@ -33,7 +31,12 @@ def import_legacy_json(path, store):
             f"'{path}' is not valid library data: {error!r}. "
             "The file was left unchanged and nothing was imported.") from error
 
-    with store.transaction():
+    def write():
+        # Checked inside the transaction so two starting processes cannot both
+        # see an empty store. Only one import can ever succeed.
+        if not store.is_empty():
+            raise AlreadyPopulatedError(
+                "Legacy data can only be imported into an empty store.")
         for book, copies in books:
             store.add_book(book)
             for copy in copies:
@@ -42,6 +45,8 @@ def import_legacy_json(path, store):
             store.add_member(member)
         for loan in loans:
             store.add_loan(*loan)
+
+    store.atomic(write)
 
 
 def _parse(data):

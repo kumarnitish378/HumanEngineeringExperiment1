@@ -1,21 +1,34 @@
 """SQLite persistence for the library.
 
-Every change happens inside transaction(): it is either committed whole or
+Every change happens inside a transaction: it is either committed whole or
 rolled back whole. No application state is cached in memory, so a failed write
 cannot leave memory and disk disagreeing. The schema also enforces the key
 rules itself, so a bug in the code above cannot store an invalid loan.
+
+atomic() is the normal way to change data. It takes the write lock before the
+first read, so all checks in the operation hold until the commit, and it reruns
+the whole operation if the database stays locked. Only a whole operation can be
+retried: a rolled-back transaction has no partial work left to resume.
 """
 
+import random
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import date
 
-from errors import CorruptedDataError, StorageError
+from errors import (
+    CorruptedDataError,
+    DatabaseBusyError,
+    IntegrityViolationError,
+    StorageError,
+)
 from models import Book, Copy, Loan, Member
 
-SCHEMA_VERSION = 1
 BUSY_TIMEOUT_SECONDS = 5
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY_SECONDS = 0.05
 TABLES = {"books", "copies", "members", "loans"}
 
 SCHEMA = (
@@ -58,48 +71,92 @@ SCHEMA = (
         BEGIN SELECT RAISE(ABORT, 'loan history cannot be deleted'); END""",
 )
 
+# Each entry upgrades the schema by one version. A new database runs them too,
+# so new and upgraded databases are always identical.
+MIGRATIONS = (
+    (
+        # The only permitted change to a loan is closing it, once.
+        """CREATE TRIGGER loan_history_is_immutable BEFORE UPDATE ON loans
+            WHEN OLD.returned_on IS NOT NULL
+                OR NEW.returned_on IS NULL
+                OR NEW.id IS NOT OLD.id
+                OR NEW.book_id IS NOT OLD.book_id
+                OR NEW.copy_id IS NOT OLD.copy_id
+                OR NEW.member_id IS NOT OLD.member_id
+                OR NEW.issued_on IS NOT OLD.issued_on
+            BEGIN SELECT RAISE(ABORT, 'loan history cannot be changed'); END""",
+        # A copy ID always names one physical item, so it is never reused.
+        """CREATE TRIGGER copy_id_matches_book BEFORE INSERT ON copies
+            WHEN NEW.id NOT GLOB NEW.book_id || '-C[1-9]*'
+            BEGIN SELECT RAISE(ABORT, 'copy ID does not match its book'); END""",
+        """CREATE TRIGGER copies_cannot_be_deleted BEFORE DELETE ON copies
+            BEGIN SELECT RAISE(ABORT, 'copies cannot be deleted'); END""",
+        """CREATE TRIGGER copies_cannot_be_changed BEFORE UPDATE ON copies
+            BEGIN SELECT RAISE(ABORT, 'copies cannot be changed'); END""",
+    ),
+)
+SCHEMA_VERSION = 1 + len(MIGRATIONS)
+
 
 class SqliteStore:
     """Reads and writes library records in one SQLite database."""
 
-    def __init__(self, path=":memory:"):
+    def __init__(self, path=":memory:", busy_timeout=BUSY_TIMEOUT_SECONDS,
+                 retry_attempts=RETRY_ATTEMPTS,
+                 retry_base_delay=RETRY_BASE_DELAY_SECONDS,
+                 sleep=time.sleep, connect=sqlite3.connect):
+        """Opens path, creating or upgrading the schema if needed.
+
+        busy_timeout is how long SQLite waits for a lock on each attempt.
+        sleep and connect can be replaced to test failures deterministically.
+        """
         self.path = path
+        self._retry_attempts = retry_attempts
+        self._retry_base_delay = retry_base_delay
+        self._sleep = sleep
         # One connection is shared, so the lock also stops two threads from
         # interleaving statements inside the same transaction.
         self._lock = threading.RLock()
         self._connection = None
         try:
-            self._connection = sqlite3.connect(
+            self._connection = connect(
                 path,
-                timeout=BUSY_TIMEOUT_SECONDS,
+                timeout=busy_timeout,
                 isolation_level=None,  # transactions are managed explicitly
                 check_same_thread=False,
             )
             self._connection.execute("PRAGMA foreign_keys = ON")
-            self._create_schema_if_new()
-            self._verify()
-        except sqlite3.OperationalError as error:
+            self._connection.execute("PRAGMA synchronous = FULL")
+            self._retrying(self._prepare)
+        except sqlite3.Error as error:
             self.close()
-            raise StorageError(f"Cannot open '{path}': {error}") from error
-        except sqlite3.DatabaseError as error:
-            self.close()
-            raise CorruptedDataError(
-                f"'{path}' is corrupted or is not a library database: {error}"
-            ) from error
-        except CorruptedDataError:
+            raise _translate(error, f"Cannot open '{path}'") from error
+        except StorageError:
             self.close()
             raise
 
     def close(self):
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc_info):
         self.close()
+
+    def atomic(self, operation):
+        """Run operation in one transaction and return its result.
+
+        If the database stays locked the whole operation runs again, up to
+        the retry limit, so it must make no changes outside the store.
+        """
+        def attempt():
+            with self.transaction():
+                return operation()
+        return self._retrying(attempt)
 
     @contextmanager
     def transaction(self):
@@ -119,8 +176,7 @@ class SqliteStore:
 
     def is_empty(self):
         return not any(
-            self._run(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-            for table in TABLES
+            self._query(f"SELECT 1 FROM {table} LIMIT 1") for table in TABLES
         )
 
     # Books and copies
@@ -133,37 +189,37 @@ class SqliteStore:
                   (book.id, book.title, book.author))
 
     def get_book(self, book_id):
-        row = self._run("SELECT id, title, author FROM books WHERE id = ?",
-                        (book_id,)).fetchone()
-        return Book(*row) if row else None
+        rows = self._query("SELECT id, title, author FROM books WHERE id = ?",
+                           (book_id,))
+        return Book(*rows[0]) if rows else None
 
     def list_books(self):
-        rows = self._run("SELECT id, title, author FROM books "
-                         "ORDER BY CAST(substr(id, 2) AS INTEGER)")
-        return [Book(*row) for row in rows.fetchall()]
+        rows = self._query("SELECT id, title, author FROM books "
+                           "ORDER BY CAST(substr(id, 2) AS INTEGER)")
+        return [Book(*row) for row in rows]
 
     def add_copy(self, copy):
         self._run("INSERT INTO copies VALUES (?, ?)", (copy.id, copy.book_id))
 
     def get_copy(self, copy_id):
-        row = self._run("SELECT id, book_id FROM copies WHERE id = ?",
-                        (copy_id,)).fetchone()
-        return Copy(*row) if row else None
+        rows = self._query("SELECT id, book_id FROM copies WHERE id = ?",
+                           (copy_id,))
+        return Copy(*rows[0]) if rows else None
 
     def list_copies(self, book_id):
-        rows = self._run(
+        rows = self._query(
             "SELECT id, book_id FROM copies WHERE book_id = ? ORDER BY rowid",
             (book_id,))
-        return [Copy(*row) for row in rows.fetchall()]
+        return [Copy(*row) for row in rows]
 
     def list_available_copies(self, book_id):
-        rows = self._run(
+        rows = self._query(
             """SELECT id, book_id FROM copies WHERE book_id = ? AND id NOT IN (
                    SELECT copy_id FROM loans
                    WHERE returned_on IS NULL AND copy_id IS NOT NULL
                ) ORDER BY rowid""",
             (book_id,))
-        return [Copy(*row) for row in rows.fetchall()]
+        return [Copy(*row) for row in rows]
 
     # Members
 
@@ -175,14 +231,14 @@ class SqliteStore:
                   (member.id, member.name))
 
     def get_member(self, member_id):
-        row = self._run("SELECT id, name FROM members WHERE id = ?",
-                        (member_id,)).fetchone()
-        return Member(*row) if row else None
+        rows = self._query("SELECT id, name FROM members WHERE id = ?",
+                           (member_id,))
+        return Member(*rows[0]) if rows else None
 
     def list_members(self):
-        rows = self._run("SELECT id, name FROM members "
-                         "ORDER BY CAST(substr(id, 2) AS INTEGER)")
-        return [Member(*row) for row in rows.fetchall()]
+        rows = self._query("SELECT id, name FROM members "
+                           "ORDER BY CAST(substr(id, 2) AS INTEGER)")
+        return [Member(*row) for row in rows]
 
     # Loans
 
@@ -239,10 +295,10 @@ class SqliteStore:
     # Internals
 
     def _select_loans(self, condition, params=()):
-        rows = self._run(
+        rows = self._query(
             "SELECT id, book_id, copy_id, member_id, issued_on, returned_on "
             f"FROM loans WHERE {condition} ORDER BY id", params)
-        return [self._to_loan(row) for row in rows.fetchall()]
+        return [self._to_loan(row) for row in rows]
 
     @staticmethod
     def _to_loan(row):
@@ -257,36 +313,87 @@ class SqliteStore:
                 f"Loan {loan_id} has an invalid date: {error}") from error
 
     def _next_number(self, table):
-        row = self._run("SELECT COALESCE(MAX(CAST(substr(id, 2) AS INTEGER)), 0) "
-                        f"FROM {table}").fetchone()
-        return row[0] + 1
+        rows = self._query(
+            "SELECT COALESCE(MAX(CAST(substr(id, 2) AS INTEGER)), 0) "
+            f"FROM {table}")
+        return rows[0][0] + 1
 
     def _run(self, sql, params=()):
+        """Execute one statement that returns no rows the caller needs."""
         with self._lock:
-            if self._connection is None:
-                raise StorageError("The data store is closed.")
+            return self._execute(sql, params)
+
+    def _query(self, sql, params=()):
+        """Return all rows of one read.
+
+        Rows are fetched under the lock, because a cursor read later could run
+        in the middle of another thread's transaction on this connection.
+        """
+        def fetch():
+            with self._lock:
+                try:
+                    return self._execute(sql, params).fetchall()
+                except sqlite3.Error as error:
+                    raise _translate(error, "Could not read data") from error
+
+        connection = self._connection
+        if connection is not None and connection.in_transaction:
+            return fetch()  # the transaction already holds the lock it needs
+        return self._retrying(fetch)
+
+    def _execute(self, sql, params):
+        if self._connection is None:
+            raise StorageError("The data store is closed.")
+        try:
+            return self._connection.execute(sql, params)
+        except sqlite3.Error as error:
+            raise _translate(error, "Could not access data") from error
+
+    def _retrying(self, attempt):
+        """Call attempt, backing off and repeating while the database is busy."""
+        for attempt_number in range(self._retry_attempts - 1):
             try:
-                return self._connection.execute(sql, params)
-            except sqlite3.Error as error:
-                raise StorageError(f"Could not access data: {error}") from error
+                return attempt()
+            except DatabaseBusyError:
+                # Random delays stop competing processes retrying in lockstep.
+                limit = self._retry_base_delay * 2 ** attempt_number
+                self._sleep(random.uniform(0, limit))
+        return attempt()
 
     def _rollback(self):
-        if self._connection is not None and self._connection.in_transaction:
-            try:
-                self._connection.execute("ROLLBACK")
-            except sqlite3.Error as error:
-                raise StorageError(f"Rollback failed: {error}") from error
-
-    def _create_schema_if_new(self):
-        connection = self._connection
-        if self._schema_version() != 0:
+        if self._connection is None or not self._connection.in_transaction:
             return
+        try:
+            self._connection.execute("ROLLBACK")
+        except sqlite3.Error as error:
+            # Closing discards the open transaction. Keeping the connection
+            # would leave later work inside a transaction that cannot commit.
+            self.close()
+            raise _translate(error, "Rollback failed") from error
+
+    def _prepare(self):
+        """Create or upgrade the schema if needed, then check the data."""
+        try:
+            if self._schema_version() < SCHEMA_VERSION:
+                self._upgrade_schema()
+            self._verify()
+        except sqlite3.Error as error:
+            raise _translate(error, f"Cannot open '{self.path}'") from error
+
+    def _upgrade_schema(self):
+        connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
-            # Checked again under the lock in case another process just did this.
-            if self._schema_version() == 0 and not self._table_names():
+            # Read under the lock in case another process just did this.
+            version = self._schema_version()
+            if version == 0 and not self._table_names():
                 for statement in SCHEMA:
                     connection.execute(statement)
+                version = 1
+            if version > 0:
+                for migration in MIGRATIONS[version - 1:]:
+                    for statement in migration:
+                        connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.execute("COMMIT")
         except BaseException:
@@ -321,3 +428,17 @@ class SqliteStore:
             "SELECT name FROM sqlite_master "
             "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").fetchall()
         return {row[0] for row in rows}
+
+
+def _translate(error, context):
+    """Turn a sqlite3 error into the specific exception callers can act on."""
+    code = getattr(error, "sqlite_errorcode", None)
+    primary_code = None if code is None else code & 0xFF
+    message = f"{context}: {error}"
+    if primary_code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return DatabaseBusyError(f"{message}. Please try again.")
+    if primary_code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        return CorruptedDataError(f"{message}. The data may be damaged.")
+    if isinstance(error, sqlite3.IntegrityError):
+        return IntegrityViolationError(message)
+    return StorageError(message)

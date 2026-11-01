@@ -46,25 +46,34 @@ class Library:
         title = _required_text(title, "Title")
         author = _required_text(author, "Author")
         _check_copy_count(copies)
-        with self._store.transaction():
+
+        def create():
             book = Book(self._store.next_book_id(), title, author)
             self._store.add_book(book)
             self._add_copies(book.id, copies)
-        return book
+            return book
+
+        return self._store.atomic(create)
 
     def add_copies(self, book_id, count=1):
         book_id = _normalize_id(book_id, BOOK_ID_PATTERN, "book")
         _check_copy_count(count)
-        with self._store.transaction():
+
+        def add():
             self._require_book(book_id)
             return self._add_copies(book_id, count)
 
+        return self._store.atomic(add)
+
     def register_member(self, name):
         name = _required_text(name, "Member name")
-        with self._store.transaction():
+
+        def register():
             member = Member(self._store.next_member_id(), name)
             self._store.add_member(member)
-        return member
+            return member
+
+        return self._store.atomic(register)
 
     def issue_book(self, book_id, member_id, copy_id=None):
         """Lend a copy to a member: the given one, or else any available one."""
@@ -72,7 +81,8 @@ class Library:
         member_id = _normalize_id(member_id, MEMBER_ID_PATTERN, "member")
         if copy_id is not None:
             copy_id = _normalize_id(copy_id, COPY_ID_PATTERN, "copy")
-        with self._store.transaction():
+
+        def issue():
             book = self._require_book(book_id)
             member = self._require_member(member_id)
             if self._store.active_loan_for_member(book.id, member.id):
@@ -81,6 +91,8 @@ class Library:
             copy = self._choose_copy(book, copy_id)
             return self._store.add_loan(
                 book.id, copy.id, member.id, self._today())
+
+        return self._store.atomic(issue)
 
     def return_book(self, book_id, member_id, copy_id=None):
         """Close the member's loan of a book, optionally naming the exact copy.
@@ -91,7 +103,8 @@ class Library:
         member_id = _normalize_id(member_id, MEMBER_ID_PATTERN, "member")
         if copy_id is not None:
             copy_id = _normalize_id(copy_id, COPY_ID_PATTERN, "copy")
-        with self._store.transaction():
+
+        def close_loan():
             book = self._require_book(book_id)
             member = self._require_member(member_id)
             if copy_id is not None:
@@ -99,8 +112,15 @@ class Library:
                 loan = self._loan_of_copy(book, member, copy_id)
             else:
                 loan = self._loan_of_book(book, member)
-            self._store.mark_returned(loan.id, self._today())
+            today = self._today()
+            if today < loan.issued_on:
+                raise ValidationError(
+                    f"Return date {today} is before the issue date "
+                    f"{loan.issued_on}. Check the system clock.")
+            self._store.mark_returned(loan.id, today)
             return self._store.get_loan(loan.id)
+
+        return self._store.atomic(close_loan)
 
     def get_book(self, book_id):
         return self._require_book(

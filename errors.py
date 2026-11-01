@@ -40,3 +40,15 @@ class StorageError(Exception):
 
 class CorruptedDataError(StorageError):
     """Stored data is damaged or unreadable. The file is left untouched."""
+
+
+class DatabaseBusyError(StorageError):
+    """The database stayed locked by another connection. Safe to try again."""
+
+
+class IntegrityViolationError(StorageError):
+    """The database refused a record that would break one of its rules."""
+
+
+class AlreadyPopulatedError(StorageError):
+    """A legacy import was refused because the store already holds data."""
